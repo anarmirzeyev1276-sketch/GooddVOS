@@ -1,0 +1,143 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Create Capacitor project
+        run: |
+          mkdir www
+          cp vos.html www/index.html
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          npx cap init VOS com.vos.app --web-dir www
+          npx cap add android
+          mkdir -p android/app/src/main/java/com/vos/app
+          cat > android/app/src/main/java/com/vos/app/NativeBrowserPlugin.java <<'EOF'
+          package com.vos.app;
+
+          import android.view.View;
+          import android.widget.FrameLayout;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @CapacitorPlugin(name = "NativeBrowser")
+          public class NativeBrowserPlugin extends Plugin {
+            private WebView wv;
+
+            private void layout(PluginCall c) {
+              float d = getActivity().getResources().getDisplayMetrics().density;
+              WebView main = getBridge().getWebView();
+              double x = c.getDouble("x", 0.0), y = c.getDouble("y", 0.0);
+              double w = c.getDouble("w", 300.0), h = c.getDouble("h", 300.0);
+              FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams((int) (w * d), (int) (h * d));
+              lp.leftMargin = (int) (main.getX() + x * d);
+              lp.topMargin = (int) (main.getY() + y * d);
+              if (wv == null) {
+                wv = new WebView(getActivity());
+                WebSettings s = wv.getSettings();
+                s.setJavaScriptEnabled(true);
+                s.setDomStorageEnabled(true);
+                s.setBuiltInZoomControls(true);
+                s.setDisplayZoomControls(false);
+                s.setUserAgentString(s.getUserAgentString().replace("; wv", ""));
+                wv.setWebViewClient(new WebViewClient());
+                wv.setWebChromeClient(new WebChromeClient());
+                getActivity().addContentView(wv, lp);
+              } else {
+                wv.setLayoutParams(lp);
+              }
+            }
+
+            @PluginMethod
+            public void open(final PluginCall c) {
+              getActivity().runOnUiThread(() -> {
+                layout(c);
+                wv.setVisibility(View.VISIBLE);
+                String u = c.getString("url");
+                if (u != null) wv.loadUrl(u);
+                c.resolve();
+              });
+            }
+
+            @PluginMethod
+            public void move(final PluginCall c) {
+              getActivity().runOnUiThread(() -> { if (wv != null) layout(c); c.resolve(); });
+            }
+
+            @PluginMethod
+            public void show(final PluginCall c) {
+              getActivity().runOnUiThread(() -> { if (wv != null) wv.setVisibility(View.VISIBLE); c.resolve(); });
+            }
+
+            @PluginMethod
+            public void hide(final PluginCall c) {
+              getActivity().runOnUiThread(() -> { if (wv != null) wv.setVisibility(View.GONE); c.resolve(); });
+            }
+
+            @PluginMethod
+            public void back(final PluginCall c) {
+              getActivity().runOnUiThread(() -> { if (wv != null && wv.canGoBack()) wv.goBack(); c.resolve(); });
+            }
+
+            @PluginMethod
+            public void reload(final PluginCall c) {
+              getActivity().runOnUiThread(() -> { if (wv != null) wv.reload(); c.resolve(); });
+            }
+          }
+          EOF
+          cat > android/app/src/main/java/com/vos/app/MainActivity.java <<'EOF'
+          package com.vos.app;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              registerPlugin(NativeBrowserPlugin.class);
+              super.onCreate(savedInstanceState);
+            }
+          }
+          EOF
+          npx cap sync android
+
+      - name: Build APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Rename APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk VOS.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: VOS v${{ github.run_number }}
+          files: VOS.apk
