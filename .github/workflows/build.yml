@@ -1,0 +1,449 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Create Capacitor project
+        run: |
+          mkdir www
+          cp index.html www/index.html
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          npx cap init VOS com.vos.app --web-dir www
+          npx cap add android
+          mkdir -p android/app/src/main/java/com/vos/app
+          cat > android/app/src/main/java/com/vos/app/NativeBrowserPlugin.java <<'EOF'
+          package com.vos.app;
+
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.FrameLayout;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.util.HashMap;
+
+          @CapacitorPlugin(name = "NativeBrowser")
+          public class NativeBrowserPlugin extends Plugin {
+            private final HashMap<String, WebView> views = new HashMap<>();
+
+            private WebView view(PluginCall c) {
+              return views.get(c.getString("id", "browser"));
+            }
+
+            private void layout(PluginCall c) {
+              float d = getActivity().getResources().getDisplayMetrics().density;
+              WebView main = getBridge().getWebView();
+              double x = c.getDouble("x", 0.0), y = c.getDouble("y", 0.0);
+              double w = c.getDouble("w", 300.0), h = c.getDouble("h", 300.0);
+              FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams((int) (w * d), (int) (h * d));
+              lp.leftMargin = (int) (main.getX() + x * d);
+              lp.topMargin = (int) (main.getY() + y * d);
+              WebView wv = view(c);
+              if (wv == null) {
+                wv = new WebView(getActivity());
+                WebSettings s = wv.getSettings();
+                s.setJavaScriptEnabled(true);
+                s.setDomStorageEnabled(true);
+                s.setBuiltInZoomControls(true);
+                s.setDisplayZoomControls(false);
+                s.setUserAgentString(s.getUserAgentString().replace("; wv", ""));
+                android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+                cm.setAcceptCookie(true);
+                cm.setAcceptThirdPartyCookies(wv, true);
+                wv.setWebViewClient(new WebViewClient());
+                wv.setWebChromeClient(new WebChromeClient());
+                views.put(c.getString("id", "browser"), wv);
+                getActivity().addContentView(wv, lp);
+              } else {
+                wv.setLayoutParams(lp);
+              }
+            }
+
+            @PluginMethod
+            public void open(final PluginCall c) {
+              getActivity().runOnUiThread(() -> {
+                layout(c);
+                WebView wv = view(c);
+                wv.setVisibility(View.VISIBLE);
+                String u = c.getString("url");
+                if (u != null) wv.loadUrl(u);
+                c.resolve();
+              });
+            }
+
+            @PluginMethod
+            public void move(final PluginCall c) {
+              getActivity().runOnUiThread(() -> { if (view(c) != null) layout(c); c.resolve(); });
+            }
+
+            @PluginMethod
+            public void show(final PluginCall c) {
+              getActivity().runOnUiThread(() -> { WebView v = view(c); if (v != null) v.setVisibility(View.VISIBLE); c.resolve(); });
+            }
+
+            @PluginMethod
+            public void hide(final PluginCall c) {
+              getActivity().runOnUiThread(() -> { WebView v = view(c); if (v != null) v.setVisibility(View.GONE); c.resolve(); });
+            }
+
+            @PluginMethod
+            public void back(final PluginCall c) {
+              getActivity().runOnUiThread(() -> { WebView v = view(c); if (v != null && v.canGoBack()) v.goBack(); c.resolve(); });
+            }
+
+            @PluginMethod
+            public void reload(final PluginCall c) {
+              getActivity().runOnUiThread(() -> { WebView v = view(c); if (v != null) v.reload(); c.resolve(); });
+            }
+
+            @PluginMethod
+            public void close(final PluginCall c) {
+              getActivity().runOnUiThread(() -> {
+                WebView v = views.remove(c.getString("id", "browser"));
+                if (v != null) {
+                  ViewGroup p = (ViewGroup) v.getParent();
+                  if (p != null) p.removeView(v);
+                  v.destroy();
+                }
+                c.resolve();
+              });
+            }
+          }
+          EOF
+          cat > android/app/src/main/java/com/vos/app/MainActivity.java <<'EOF'
+          package com.vos.app;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              registerPlugin(NativeBrowserPlugin.class);
+              registerPlugin(LauncherPlugin.class);
+              registerPlugin(VosFilesPlugin.class);
+              registerPlugin(BiometricPlugin.class);
+              super.onCreate(savedInstanceState);
+            }
+          }
+          EOF
+          cat > android/app/src/main/java/com/vos/app/LauncherPlugin.java <<'EOF'
+          package com.vos.app;
+
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.drawable.Drawable;
+          import android.net.Uri;
+          import android.util.Base64;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.ByteArrayOutputStream;
+          import java.util.List;
+
+          @CapacitorPlugin(name = "Launcher")
+          public class LauncherPlugin extends Plugin {
+            private String icon(Drawable d) {
+              Bitmap b = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888);
+              d.setBounds(0, 0, 96, 96);
+              d.draw(new Canvas(b));
+              ByteArrayOutputStream s = new ByteArrayOutputStream();
+              b.compress(Bitmap.CompressFormat.PNG, 100, s);
+              return Base64.encodeToString(s.toByteArray(), Base64.NO_WRAP);
+            }
+
+            @PluginMethod
+            public void getApps(final PluginCall c) {
+              new Thread(() -> {
+                PackageManager pm = getContext().getPackageManager();
+                Intent i = new Intent(Intent.ACTION_MAIN);
+                i.addCategory(Intent.CATEGORY_LAUNCHER);
+                List<ResolveInfo> l = pm.queryIntentActivities(i, 0);
+                JSArray arr = new JSArray();
+                for (ResolveInfo r : l) {
+                  String pkg = r.activityInfo.packageName;
+                  if (pkg.equals(getContext().getPackageName())) continue;
+                  try {
+                    JSObject o = new JSObject();
+                    o.put("pkg", pkg);
+                    o.put("label", r.loadLabel(pm).toString());
+                    o.put("icon", icon(r.loadIcon(pm)));
+                    arr.put(o);
+                  } catch (Exception e) { }
+                }
+                JSObject res = new JSObject();
+                res.put("apps", arr);
+                c.resolve(res);
+              }).start();
+            }
+
+            @PluginMethod
+            public void launch(final PluginCall c) {
+              Intent i = getContext().getPackageManager().getLaunchIntentForPackage(c.getString("pkg", ""));
+              if (i != null) {
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(i);
+              }
+              c.resolve();
+            }
+
+            @PluginMethod
+            public void uninstall(final PluginCall c) {
+              Intent i = new Intent(Intent.ACTION_DELETE, Uri.parse("package:" + c.getString("pkg", "")));
+              i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+              getContext().startActivity(i);
+              c.resolve();
+            }
+          }
+          EOF
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's#\(<category android:name="android.intent.category.LAUNCHER"[^>]*>\)#\1<category android:name="android.intent.category.HOME"/><category android:name="android.intent.category.DEFAULT"/>#' $M
+          sed -i 's#</manifest>#<queries><intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent></queries><uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES"/></manifest>#' $M
+          cat > android/app/src/main/java/com/vos/app/VosFilesPlugin.java <<'EOF'
+          package com.vos.app;
+
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.Settings;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.FileProvider;
+          import android.webkit.MimeTypeMap;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.File;
+          import java.util.ArrayDeque;
+          import java.util.Arrays;
+
+          @CapacitorPlugin(name = "VosFiles")
+          public class VosFilesPlugin extends Plugin {
+            private boolean allowed() {
+              if (Build.VERSION.SDK_INT >= 30) return Environment.isExternalStorageManager();
+              return ContextCompat.checkSelfPermission(getContext(), "android.permission.READ_EXTERNAL_STORAGE") == PackageManager.PERMISSION_GRANTED;
+            }
+
+            private File root() {
+              return Environment.getExternalStorageDirectory();
+            }
+
+            private JSObject item(File f) {
+              JSObject o = new JSObject();
+              o.put("name", f.getName());
+              o.put("path", f.getAbsolutePath());
+              o.put("dir", f.isDirectory());
+              o.put("size", f.length());
+              return o;
+            }
+
+            @PluginMethod
+            public void openFile(final PluginCall c) {
+              File f = new File(c.getString("path", ""));
+              try {
+                Uri u = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", f);
+                String n = f.getName();
+                int d = n.lastIndexOf('.');
+                String mime = d >= 0 ? MimeTypeMap.getSingleton().getMimeTypeFromExtension(n.substring(d + 1).toLowerCase()) : null;
+                Intent i = new Intent(Intent.ACTION_VIEW);
+                i.setDataAndType(u, mime == null ? "*/*" : mime);
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(i);
+                c.resolve();
+              } catch (Exception e) {
+                c.reject("cannot open");
+              }
+            }
+
+            @PluginMethod
+            public void hasAccess(final PluginCall c) {
+              JSObject o = new JSObject();
+              o.put("ok", allowed());
+              c.resolve(o);
+            }
+
+            @PluginMethod
+            public void requestAccess(final PluginCall c) {
+              if (Build.VERSION.SDK_INT >= 30) {
+                Intent i = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + getContext().getPackageName()));
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(i);
+              } else {
+                ActivityCompat.requestPermissions(getActivity(), new String[] {"android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE"}, 77);
+              }
+              c.resolve();
+            }
+
+            @PluginMethod
+            public void list(final PluginCall c) {
+              if (!allowed()) { c.reject("denied"); return; }
+              File dir = new File(c.getString("path", root().getAbsolutePath()));
+              if (!dir.isDirectory()) { c.reject("not a directory"); return; }
+              File[] fs = dir.listFiles();
+              JSArray arr = new JSArray();
+              if (fs != null) {
+                Arrays.sort(fs, (a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+                int n = 0;
+                for (File f : fs) {
+                  if (n++ > 3000) break;
+                  arr.put(item(f));
+                }
+              }
+              boolean atRoot = dir.getAbsolutePath().equals(root().getAbsolutePath());
+              JSObject res = new JSObject();
+              res.put("path", dir.getAbsolutePath());
+              res.put("parent", (atRoot || dir.getParent() == null) ? "" : dir.getParent());
+              res.put("items", arr);
+              c.resolve(res);
+            }
+
+            @PluginMethod
+            public void search(final PluginCall c) {
+              if (!allowed()) { c.reject("denied"); return; }
+              final String q = c.getString("q", "").toLowerCase();
+              final File start = new File(c.getString("path", root().getAbsolutePath()));
+              new Thread(() -> {
+                JSArray arr = new JSArray();
+                ArrayDeque<File> dq = new ArrayDeque<>();
+                dq.add(start);
+                int seen = 0, found = 0;
+                while (!dq.isEmpty() && seen < 20000 && found < 200) {
+                  File[] fs = dq.poll().listFiles();
+                  if (fs == null) continue;
+                  for (File f : fs) {
+                    seen++;
+                    if (f.getName().toLowerCase().contains(q)) { arr.put(item(f)); found++; }
+                    if (f.isDirectory() && !f.getName().startsWith(".")) dq.add(f);
+                  }
+                }
+                JSObject res = new JSObject();
+                res.put("items", arr);
+                c.resolve(res);
+              }).start();
+            }
+
+            @PluginMethod
+            public void delete(final PluginCall c) {
+              File f = new File(c.getString("path", ""));
+              JSObject o = new JSObject();
+              o.put("ok", allowed() && f.isFile() && f.delete());
+              c.resolve(o);
+            }
+          }
+          EOF
+          cat > android/app/src/main/java/com/vos/app/BiometricPlugin.java <<'EOF'
+          package com.vos.app;
+
+          import androidx.biometric.BiometricManager;
+          import androidx.biometric.BiometricPrompt;
+          import androidx.core.content.ContextCompat;
+          import androidx.fragment.app.FragmentActivity;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @CapacitorPlugin(name = "Biometric")
+          public class BiometricPlugin extends Plugin {
+            private boolean can() {
+              return BiometricManager.from(getContext()).canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) == BiometricManager.BIOMETRIC_SUCCESS;
+            }
+
+            @PluginMethod
+            public void available(final PluginCall c) {
+              JSObject o = new JSObject();
+              o.put("ok", can());
+              c.resolve(o);
+            }
+
+            @PluginMethod
+            public void verify(final PluginCall c) {
+              getActivity().runOnUiThread(() -> {
+                if (!can()) { c.reject("unavailable"); return; }
+                BiometricPrompt bp = new BiometricPrompt((FragmentActivity) getActivity(), ContextCompat.getMainExecutor(getContext()), new BiometricPrompt.AuthenticationCallback() {
+                  @Override
+                  public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult r) { c.resolve(); }
+
+                  @Override
+                  public void onAuthenticationError(int code, CharSequence msg) { c.reject(String.valueOf(msg)); }
+                });
+                BiometricPrompt.PromptInfo info = new BiometricPrompt.PromptInfo.Builder()
+                  .setTitle(c.getString("title", "VOS"))
+                  .setNegativeButtonText(c.getString("cancel", "PIN"))
+                  .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+                  .build();
+                bp.authenticate(info);
+              });
+            }
+          }
+          EOF
+          sed -i 's#</manifest>#<uses-permission android:name="android.permission.USE_BIOMETRIC"/><uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/></manifest>#' $M
+          sed -i 's#^dependencies {#dependencies {\n    implementation "androidx.biometric:biometric:1.1.0"#' android/app/build.gradle
+          npx cap sync android
+
+      - name: Stable signing key
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            git config user.name github-actions
+            git config user.email actions@github.com
+            git add debug.keystore
+            git commit -m "Add signing key"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+          cp debug.keystore ~/.android/debug.keystore
+
+      - name: Build APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Rename APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk VOS.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: VOS v${{ github.run_number }}
+          files: VOS.apk
+          
