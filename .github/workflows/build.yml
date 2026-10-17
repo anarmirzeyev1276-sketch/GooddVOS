@@ -142,11 +142,103 @@ jobs:
             @Override
             public void onCreate(Bundle savedInstanceState) {
               registerPlugin(NativeBrowserPlugin.class);
+              registerPlugin(LauncherPlugin.class);
               super.onCreate(savedInstanceState);
             }
           }
           EOF
+          cat > android/app/src/main/java/com/vos/app/LauncherPlugin.java <<'EOF'
+          package com.vos.app;
+
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.drawable.Drawable;
+          import android.net.Uri;
+          import android.util.Base64;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.ByteArrayOutputStream;
+          import java.util.List;
+
+          @CapacitorPlugin(name = "Launcher")
+          public class LauncherPlugin extends Plugin {
+            private String icon(Drawable d) {
+              Bitmap b = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888);
+              d.setBounds(0, 0, 96, 96);
+              d.draw(new Canvas(b));
+              ByteArrayOutputStream s = new ByteArrayOutputStream();
+              b.compress(Bitmap.CompressFormat.PNG, 100, s);
+              return Base64.encodeToString(s.toByteArray(), Base64.NO_WRAP);
+            }
+
+            @PluginMethod
+            public void getApps(final PluginCall c) {
+              new Thread(() -> {
+                PackageManager pm = getContext().getPackageManager();
+                Intent i = new Intent(Intent.ACTION_MAIN);
+                i.addCategory(Intent.CATEGORY_LAUNCHER);
+                List<ResolveInfo> l = pm.queryIntentActivities(i, 0);
+                JSArray arr = new JSArray();
+                for (ResolveInfo r : l) {
+                  String pkg = r.activityInfo.packageName;
+                  if (pkg.equals(getContext().getPackageName())) continue;
+                  try {
+                    JSObject o = new JSObject();
+                    o.put("pkg", pkg);
+                    o.put("label", r.loadLabel(pm).toString());
+                    o.put("icon", icon(r.loadIcon(pm)));
+                    arr.put(o);
+                  } catch (Exception e) { }
+                }
+                JSObject res = new JSObject();
+                res.put("apps", arr);
+                c.resolve(res);
+              }).start();
+            }
+
+            @PluginMethod
+            public void launch(final PluginCall c) {
+              Intent i = getContext().getPackageManager().getLaunchIntentForPackage(c.getString("pkg", ""));
+              if (i != null) {
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(i);
+              }
+              c.resolve();
+            }
+
+            @PluginMethod
+            public void uninstall(final PluginCall c) {
+              Intent i = new Intent(Intent.ACTION_DELETE, Uri.parse("package:" + c.getString("pkg", "")));
+              i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+              getContext().startActivity(i);
+              c.resolve();
+            }
+          }
+          EOF
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's#\(<category android:name="android.intent.category.LAUNCHER"[^>]*>\)#\1<category android:name="android.intent.category.HOME"/><category android:name="android.intent.category.DEFAULT"/>#' $M
+          sed -i 's#</manifest>#<queries><intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent></queries><uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES"/></manifest>#' $M
           npx cap sync android
+
+      - name: Stable signing key
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            git config user.name github-actions
+            git config user.email actions@github.com
+            git add debug.keystore
+            git commit -m "Add signing key"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+          cp debug.keystore ~/.android/debug.keystore
 
       - name: Build APK
         run: |
